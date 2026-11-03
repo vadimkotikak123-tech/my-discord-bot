@@ -4,9 +4,16 @@ import time
 import secrets
 import random
 import asyncio
-import aiohttp
 import discord
 from discord.ext import commands
+
+# Подключаем библиотеку для чтения .env файла
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("⚠️ ВНИМАНИЕ: Библиотека python-dotenv не установлена.")
+    print("Выполни в консоли: pip install python-dotenv")
 
 # ============================================================
 #  НАСТРОЙКИ
@@ -14,12 +21,13 @@ from discord.ext import commands
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'keys.db')
 
-# ⚠️ СМЕНИ ТОКЕН! Старый скомпрометирован.
-BOT_TOKEN = "MTU2NTcxNTU2MjQ1NjE1NDE2Mg.G6Cl4F.2E1ChGVYEslcOuNGVgRHCyzUh7ci4c3ggpvS08"
+# Токен берется из файла .env (переменная DISCORD_TOKEN)
+BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 
-# URL твоего Flask-сервера (без слеша в конце)
-SERVER_URL = "https://ananasvisuals.pythonanywhere.com"
-ADMIN_TOKEN = "ananas222pro"  # тот же, что в app.py
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: Токен не найден!")
+    print("Создай файл .env в папке с ботом и напиши там: DISCORD_TOKEN=твой_токен")
+    exit(1)
 
 # ID ролей
 ADMIN_ROLE_ID = 1390996907115024464
@@ -76,29 +84,17 @@ def is_user():
     return commands.check(predicate)
 
 # ============================================================
-#  ВЗАИМОДЕЙСТВИЕ С FLASK-СЕРВЕРОМ
-# ============================================================
-async def server_post(path: str, data: dict):
-    """POST-запрос к админке Flask с токеном в query."""
-    url = f"{SERVER_URL}{path}?token={ADMIN_TOKEN}"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, data=data, timeout=10) as r:
-                return r.status, await r.text()
-    except Exception as e:
-        return None, str(e)
-
-# ============================================================
 #  ON_READY
 # ============================================================
 @bot.event
 async def on_ready():
     print(f'🔥 Бот {bot.user.name} запущен!')
+    print(f'📂 База данных: {DB_PATH}')
     try:
         synced = await bot.tree.sync()
-        print(f'Синхронизировано {len(synced)} слэш-команд')
+        print(f'✅ Синхронизировано {len(synced)} слэш-команд')
     except Exception as e:
-        print(f'Ошибка синхронизации: {e}')
+        print(f'⚠️ Ошибка синхронизации слэш-команд: {e}')
 
 # ============================================================
 #  АДМИН-КОМАНДЫ
@@ -178,7 +174,7 @@ async def unfreeze_key(ctx, key: str):
 @bot.command(name="бан_ип")
 @is_admin()
 async def ban_ip(ctx, ip: str, *, reason: str = "без причины"):
-    """Забанить IP на сервере. Пример: !бан_ип 1.2.3.4 Читер"""
+    """Забанить IP. Пример: !бан_ип 1.2.3.4 Читер"""
     db_query('INSERT OR REPLACE INTO ip_bans (ip, reason) VALUES (?, ?)', (ip, reason), commit=True)
     await ctx.send(f"⛔ IP `{ip}` забанен. Причина: {reason}")
 
@@ -202,7 +198,7 @@ async def toggle_maintenance(ctx):
 @bot.command(name="логи")
 @is_admin()
 async def show_logs(ctx, limit: int = 15):
-    """Показать последние подозрительные действия."""
+    """Показать последние действия."""
     rows = db_query('SELECT * FROM logs ORDER BY id DESC LIMIT ?', (limit,), fetchall=True)
     if not rows:
         await ctx.send("Логов нет.")
@@ -263,6 +259,156 @@ async def check_key(ctx, key: str):
     await ctx.send(embed=embed)
 
 # ============================================================
+#  ИГРА «САПЁР» (Награда: роль пользователя)
+# ============================================================
+
+class MinesweeperView(discord.ui.View):
+    def __init__(self, bombs: int, author: discord.Member, grid_size: int = 5):
+        super().__init__(timeout=300)
+        self.grid_size = grid_size
+        self.bombs = bombs
+        self.author = author
+        self.revealed = [[False] * grid_size for _ in range(grid_size)]
+        self.grid = [["0"] * grid_size for _ in range(grid_size)]
+        self.game_over = False
+        self._build_grid()
+        self._build_buttons()
+
+    def _build_grid(self):
+        placed = 0
+        while placed < self.bombs:
+            r = random.randint(0, self.grid_size - 1)
+            c = random.randint(0, self.grid_size - 1)
+            if self.grid[r][c] != "💣":
+                self.grid[r][c] = "💣"
+                placed += 1
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.grid[r][c] == "💣":
+                    continue
+                cnt = 0
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size \
+                                and self.grid[nr][nc] == "💣":
+                            cnt += 1
+                self.grid[r][c] = str(cnt)
+
+    def _build_buttons(self):
+        emoji_map = {"0": "0️⃣", "1": "1️⃣", "2": "2️⃣", "3": "3️⃣",
+                     "4": "4️⃣", "5": "5️⃣", "6": "6️⃣", "7": "7️⃣",
+                     "8": "8️⃣", "💣": "💣"}
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                btn = discord.ui.Button(
+                    label="?",
+                    style=discord.ButtonStyle.secondary,
+                    row=r,
+                    custom_id=f"cell_{r}_{c}"
+                )
+                btn.callback = self._make_callback(r, c)
+                self.add_item(btn)
+        self.emoji_map = emoji_map
+
+    def _make_callback(self, r, c):
+        async def cb(interaction: discord.Interaction):
+            if interaction.user.id != self.author.id:
+                await interaction.response.send_message("Это не твоя игра!", ephemeral=True)
+                return
+            if self.game_over:
+                await interaction.response.send_message("Игра окончена.", ephemeral=True)
+                return
+            if self.revealed[r][c]:
+                await interaction.response.send_message("Уже открыто.", ephemeral=True)
+                return
+
+            self.revealed[r][c] = True
+            cell = self.grid[r][c]
+
+            btn = None
+            for it in self.children:
+                if it.custom_id == f"cell_{r}_{c}":
+                    btn = it
+                    break
+
+            if cell == "💣":
+                self.game_over = True
+                for rr in range(self.grid_size):
+                    for cc in range(self.grid_size):
+                        for it in self.children:
+                            if it.custom_id == f"cell_{rr}_{cc}":
+                                val = self.grid[rr][cc]
+                                it.label = self.emoji_map[val]
+                                if val == "💣":
+                                    it.style = discord.ButtonStyle.danger
+                                else:
+                                    it.style = discord.ButtonStyle.secondary
+                                it.disabled = True
+                await interaction.response.edit_message(
+                    content="💥 **Ты наступил на мину! Игра окончена.**",
+                    view=self
+                )
+                self.stop()
+                return
+
+            btn.label = self.emoji_map[cell]
+            btn.style = discord.ButtonStyle.success
+            btn.disabled = True
+
+            opened = sum(sum(1 for x in row if x) for row in self.revealed)
+            total_safe = self.grid_size * self.grid_size - self.bombs
+            if opened >= total_safe:
+                self.game_over = True
+                for it in self.children:
+                    it.disabled = True
+                
+                role = interaction.guild.get_role(USER_ROLE_ID)
+                reward_text = ""
+                if role:
+                    try:
+                        await interaction.user.add_roles(role, reason="Победа в Сапёре")
+                        reward_text = f"\n🎁 Тебе выдана роль {role.mention}!"
+                    except discord.Forbidden:
+                        reward_text = "\n⚠️ Не смог выдать роль (проверь права бота)."
+                
+                await interaction.response.edit_message(
+                    content=f"🎉 **Победа! Все безопасные клетки открыты.**{reward_text}",
+                    view=self
+                )
+                self.stop()
+                return
+
+            await interaction.response.edit_message(view=self)
+        return cb
+
+@bot.command(name="сапер")
+async def minesweeper(ctx, bombs: int = 5):
+    """Кнопочный сапёр. Победа = выдача роли пользователя."""
+    if bombs < 1 or bombs > 15:
+        await ctx.send("❌ Кол-во бомб: 1–15.")
+        return
+    view = MinesweeperView(bombs=bombs, author=ctx.author)
+    role = discord.utils.get(ctx.guild.roles, id=USER_ROLE_ID)
+    role_mention = role.mention if role else "пользователя"
+    
+    embed = discord.Embed(
+        title="💥 Сапёр",
+        description=f"Поле 5×5, мин: **{bombs}**.\nПобеда = выдача роли {role_mention}",
+        color=discord.Color.orange()
+    )
+    await ctx.send(embed=embed, view=view)
+
+@bot.command(name="куб")
+async def roll_dice(ctx):
+    """Бросить кубик."""
+    await ctx.send(f"🎲 Выпало: **{random.randint(1, 6)}**")
+
+# ============================================================
+#  ЗАПУСК
+# ============================================================
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)=============
 #  ИГРА «САПЁР» с выдачей роли за победу
 # ============================================================
 
